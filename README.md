@@ -1,2 +1,3 @@
 # ViTy-Face
-A ViT Face Recognition model.
+A clean and hackable ViT face recognition model trained on WebFaces42.
+
