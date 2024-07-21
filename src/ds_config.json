@@ -1,0 +1,25 @@
+{
+  "train_batch_size": 256,
+  "gradient_clipping": 1.0,
+  "optimizer": {
+    "type": "Adam",
+    "params": {
+      "lr": 0.00015
+    }
+  },
+  "fp16": {
+    "enabled": false
+  },
+  "zero_optimization": true,
+  "scheduler": {
+    "type": "WarmupLR",
+    "params": {
+	"warmup_min_lr": 0,
+	"warmup_max_lr": 0.001,
+	"warmup_num_steps": 1000
+     },
+  },
+  "wandb": {
+    "enabled": true
+  }
+}

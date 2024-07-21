@@ -274,7 +274,6 @@ class VisionTransformer(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(prev_type)
 
-
     def forward(self, x):
         B, c, w, h = x.shape
         x = self.patch_embed(x)
