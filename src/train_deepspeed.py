@@ -12,7 +12,9 @@ IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 parser = argparse.ArgumentParser(description='DeepSpeed script')
-parser.add_argument('--batch_size', type=int, default=32, help='')
+parser.add_argument('--local_rank', type=int, default=-1,
+                    help='local rank passed from distributed launcher')
+parser.add_argument('--batch_size', type=int, default=28, help='')
 parser.add_argument('--dataset_root', type=str, default='/lfs_nvme/jmathai/webfaces/WebFace260M', help='')
 # Include DeepSpeed configuration arguments
 parser = deepspeed.add_config_arguments(parser)

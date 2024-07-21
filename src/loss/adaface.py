@@ -10,12 +10,6 @@ from torch.distributed.nn.functional import _AllGather
 from torch.nn.functional import linear, normalize
 
 
-def l2_norm(input, axis=1):
-    norm = torch.norm(input, 2, axis,True)
-    output = torch.div(input, norm)
-    return output
-
-
 class PartialFC_AdaFace(nn.Module):
     def __init__(
         self,

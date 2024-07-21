@@ -1,5 +1,5 @@
 {
-  "train_batch_size": 256,
+  "train_batch_size": 224,
   "gradient_clipping": 1.0,
   "optimizer": {
     "type": "Adam",
