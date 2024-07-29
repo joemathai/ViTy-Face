@@ -1,12 +1,14 @@
 # OG version can be found here : https://github.com/mk-minchul/AdaFace/blob/master/head.py
 # Combined the partial_fc method with AdaFace
-# this code will automatically shard the class centers across GPUs and do per gpu cross-entropy loss 
-# by gathering the relavent query samples into the gpu
+# Assumption: All the GPUs sees the exact same batch. (not very compute efficient)
+# Each rank computes the backbone and a part of the final classification layer. 
+# A reduce operation is used obtain the sum of exp of logits needed for the denominator of the cross-entropy loss
+# Each rank will compute the cross entropy loss for the samples whose weight centers are in the local rank (numerator of CELoss)
 
 import torch
 import math
 import torch.nn as nn
-from torch.distributed.nn.functional import _AllGather
+import torch.distributed as dist
 from torch.nn.functional import linear, normalize
 
 
@@ -45,54 +47,67 @@ class PartialFC_AdaFace(nn.Module):
         self.register_buffer('batch_mean', torch.ones(1) * 20)
         self.register_buffer('batch_std', torch.ones(1) * 100)
 
-        # local cross entropy loss
-        # TODO: check if distributed cross-entropy makes sense?
-        self.ce_loss = torch.nn.CrossEntropyLoss()
-
     def forward(self, x, labels):
-        _gather_x = torch.cat(_AllGather.apply(None, x))
-        _gather_x_norms = _gather_x.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
-        _gather_labels = torch.cat(_AllGather.apply(None, labels))
-       
-        # pick samples that have their weight centers in this shard
-        labels = _gather_labels.view(-1, 1)
-        index_positive = (self._class_start <= labels) & (labels < self._class_start + self._local_num)
-        embeddings = _gather_x[index_positive.squeeze()]
-        labels = _gather_labels[index_positive.squeeze()] - self._class_start
+        x_norms = x.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
+        labels = labels.view(-1, 1)
         
-        norm_embeddings = normalize(embeddings)
+        # index of samples whose weight centers are in this rank
+        index_positive = (self._class_start <= labels) & (labels < self._class_start + self._local_num)
+
+        norm_embeddings = normalize(x)
         norm_weight_activated = normalize(self._weights)
         cosine = linear(norm_embeddings, norm_weight_activated).clamp(-1, 1)
 
-        safe_norms = torch.clip(_gather_x_norms, min=0.001, max=100).clone().detach()
+        safe_norms = torch.clip(x_norms, min=0.001, max=100)
         with torch.no_grad():
             mean = safe_norms.mean()
             std = safe_norms.std()
+            dist.all_reduce(mean, dist.ReduceOp.SUM)
+            dist.all_reduce(std, dist.ReduceOp.SUM)
+            # avg of avg (same subsets)
+            mean = mean / dist.get_world_size()
+            std = std / dist.get_world_size()
             self.batch_mean = mean * self.t_alpha + (1 - self.t_alpha) * self.batch_mean
             self.batch_std =  std * self.t_alpha + (1 - self.t_alpha) * self.batch_std
 
-        margin_scaler = (safe_norms[index_positive.squeeze()] - self.batch_mean) / (self.batch_std + self.eps)
+        margin_scaler = (safe_norms - self.batch_mean) / (self.batch_std + self.eps)
         margin_scaler = margin_scaler * self.h
         margin_scaler = torch.clip(margin_scaler, -1, 1)
+       
+        # g_angular, g_additive and scaling
+        margin_final_logit = torch.cos(torch.arccos(cosine) + (self.m * margin_scaler * -1))
+        scaled_cosine_m = self.s * (margin_final_logit - (self.m + (self.m * margin_scaler)))
 
-        # g_angular
-        m_arc = torch.zeros(labels.size()[0], cosine.size()[1], device=cosine.device)
-        m_arc.scatter_(1, labels.reshape(-1, 1), 1.0)
-        g_angular = self.m * margin_scaler * -1
-        m_arc = m_arc * g_angular
-        theta = cosine.acos()
-        theta_m = torch.clip(theta + m_arc, min=self.eps, max=math.pi-self.eps)
-        cosine = theta_m.cos()
+        # distributed cross-entropy loss
+        logits_exp = torch.exp(scaled_cosine_m)
+        # calculate the common denominator for the distributed cross-entropy loss
+        sum_logits_exp = torch.sum(logits_exp, dim=1, keepdim=True)
+        dist.all_reduce(sum_logits_exp, dist.ReduceOp.SUM)
+        
+        # compute the cross-entropy loss for this shard
+        loss = logits_exp[index_positive.squeeze()] / sum_logits_exp[index_positive.squeeze()]
+        # FIXME: this is hack if the bacth doesn't have samples whose weight are present here,
+        # pass a very small random noise as gradient in this case
+        if loss.nelement() == 0: 
+            return scaled_cosine_m.mean() * 1e-30
 
-        # g_additive
-        m_cos = torch.zeros(labels.size()[0], cosine.size()[1], device=cosine.device)
-        m_cos.scatter_(1, labels.reshape(-1, 1), 1.0)
-        g_add = self.m + (self.m * margin_scaler)
-        m_cos = m_cos * g_add
-        cosine = cosine - m_cos
+        ce_loss = loss.clamp_min(1e-30).log_().mean() * -1
+        return ce_loss
 
-        # scale
-        scaled_cosine_m = cosine * self.s
-        loss = self.ce_loss(scaled_cosine_m, labels)
-        return loss
+
+if __name__ == "__main__":
+    # unit-test 
+    # torchrun --nnodes=1 --nproc-per-node=2 loss/adaface.py
+    dist.init_process_group(backend="nccl")
+    embedding = torch.randn(10, 1536).to(dist.get_rank())
+    labels = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).to(dist.get_rank())
+    model = PartialFC_AdaFace(embedding_size=1536, rank=dist.get_rank(), world_size=dist.get_world_size()).to(dist.get_rank())
+    opt = torch.optim.Adam(model.parameters(), lr=1e1)
+    for i in range(10):
+        opt.zero_grad()
+        y = model(embedding, labels)
+        if y: 
+            y.backward()
+            opt.step()
+        print(y)
 
